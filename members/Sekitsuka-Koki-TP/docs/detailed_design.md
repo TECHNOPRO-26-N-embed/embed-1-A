@@ -58,6 +58,7 @@
   secretCode[4] : byte = {0, 0, 0, 0}   // 正解コード（重複なし）
   inputCode[4] : byte = {0, 0, 0, 0}    // ユーザー入力コード
   judgeResult[4] : byte = {0, 0, 0, 0}  // 判定結果（2:緑, 1:黄, 0:赤）
+  judgeDisplayDone : bool = false       // 判定4桁表示が完了したか
   inputLength : byte = 0                // 現在の入力桁数
   attemptCount : byte = 0               // 現在の試行回数（上限10回）
   ledIndex : byte = 0                   // 判定表示中の桁位置（0〜3）
@@ -115,12 +116,12 @@
 3. 状態ごとに分岐する。
 
 ＜currentState が 0（入力待ち）のとき＞
-- 入力編集（数字追加、`#`削除）を受け付ける。
-- `*` が押された場合は `startJudgeIfReady()` を呼ぶ。
+- 入力編集（数字追加、`#`削除）と `*` による判定開始を受け付ける。
+- 実際のキー処理は手順2の `handleInputKey(key)` で一元的に行う。
 
 ＜currentState が 1（判定表示）のとき＞
 - `updateLedOutput()` を周期実行し、`ledIndex` を進める。
-- 4桁表示が完了したら、完全一致なら 2（クリア）へ遷移する。
+- `judgeDisplayDone == true`（4桁表示完了）になったら、完全一致なら 2（クリア）へ遷移する。
 - 不正解なら `attemptCount++` し、`checkAttemptLimit()` の結果で分岐。
   - 上限未到達: 失敗演出後に 0（入力待ち）へ戻る。
   - 上限到達: 失敗演出後に `resetGame()` を呼び、0（入力待ち）へ戻る。
@@ -151,7 +152,7 @@
 3. 押下がない場合は `lastKey` を `\0` にして `\0` を返す。
 4. `now - lastDebounceTime < DEBOUNCE_DELAY` ならチャタリングとして `\0` を返す。
 5. 直前キーと同一で押しっぱなしの場合は `\0` を返す。
-6. キーが `0〜9` `*` `#` のいずれかなら確定キーとして返す。
+6. キーが `0〜9` `*` `#` のいずれかなら、`lastKey = key`、`lastDebounceTime = now`、`lastKeyMillis = now` を更新して確定キーとして返す。
 7. それ以外は無効キーとして `\0` を返す。
 ```
 
@@ -211,7 +212,7 @@
 3. 2周目で未確定桁について「値一致・位置違い（黄=1）」を判定する。
 4. 上記に該当しない桁を「不一致（赤=0）」にする。
 5. 結果を `judgeResult[4]` に保存する。
-6. `ledIndex = 0`、`lastLedMillis = millis()`、`judgeStartMillis = millis()` を設定する。
+6. `ledIndex = 0`、`judgeDisplayDone = false`、`lastLedMillis = millis()`、`judgeStartMillis = millis()` を設定する。
 ```
 
 ---
@@ -226,7 +227,7 @@
 
 ```
 【処理の流れ】
-1. `now - lastLedMillis < LED_STEP_INTERVAL` なら何もしない。
+1. `now = millis()` を取得し、`now - lastLedMillis < LED_STEP_INTERVAL` なら何もしない。
 2. 3色LEDを一度消灯する。
 3. `judgeResult[ledIndex]` に応じて対象色のみ点灯する。
   - 2: 緑LED点灯
@@ -234,7 +235,7 @@
   - 0: 赤LED点灯
 4. `lastLedMillis = now` に更新する。
 5. `ledIndex++` する。
-6. `ledIndex >= 4` になったら全LED消灯し、表示完了フラグを立てる。
+6. `ledIndex >= 4` になったら全LED消灯し、`judgeDisplayDone = true` にする。
 ```
 
 ---
@@ -250,7 +251,7 @@
 ```
 【処理の流れ】
 1. `inputCode` と `judgeResult` を 0 でクリアする。
-2. `inputLength = 0`, `attemptCount = 0`, `ledIndex = 0` にする。
+2. `inputLength = 0`, `attemptCount = 0`, `ledIndex = 0`, `judgeDisplayDone = false` にする。
 3. 状態を `currentState = 0`（入力待ち）にする。
 4. `generateSecretCode()` を呼び、新しいゲームを開始する。
 5. 必要なら開始演出（緑短点灯など）を行う。
@@ -268,7 +269,7 @@
 ```
 【処理の流れ】
 1. 候補配列 `digits[10] = {0..9}` を用意する。
-2. Fisher-Yates 方式で配列をシャッフルする。
+2. Fisher-Yates 方式（配列を偏りなく並べ替える手法）でシャッフルする。
 3. 先頭4要素を `secretCode[0..3]` に格納する。
 4. デバッグ時のみシリアルに出力して確認する。
 ```
@@ -309,7 +310,7 @@
   - true を返す。
 3. false の場合:
   - `currentState = 3`（ミス入力通知）に遷移する。
-  - `notifyInvalidInput()` で赤点滅を開始する。
+  - 通知処理は `loop()` の state=3 分岐で開始・実行する。
   - false を返す。
 ```
 
@@ -411,8 +412,8 @@
 ```
 【処理の流れ】
 1. ジョイスティックX軸値を読み取る（任意でA1使用）。
-2. デッドゾーン（例: 480〜544）内は桁位置を維持する。
-3. 右倒しで +1、左倒しで -1（0〜3でクリップ）する。
+2. デッドゾーン（中央付近の微小な揺れを無視する範囲。例: 480〜544）内は桁位置を維持する。
+3. 右倒しで +1、左倒しで -1（0〜3の範囲を超えないように値を固定=クリップ）する。
 4. 更新後の桁インデックスを返す。
 ```
 
@@ -582,13 +583,13 @@
 
 | No | 指摘内容 | 指摘者 | 対応 |
 |:---|:---|:---|:---|
-| 1 |  |  |  |
+| 1 | フラグや点滅などが明確ではない |  | 対応した |
 | 2 |  |  |  |
 | 3 |  |  |  |
 
 ### 7-2. レビューを受けて変更した点
 
--
+-変数名や時間を記入した
 -
 
 ---
