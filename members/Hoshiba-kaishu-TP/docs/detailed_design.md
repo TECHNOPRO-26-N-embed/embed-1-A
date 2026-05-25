@@ -19,10 +19,10 @@
 
 | 項目 | basic_design.md から転記 |
 |:--|:--|
-| 作品タイトル | |
-| 状態の種類（1-2 状態遷移から） | |
-| 実装する関数の数（2-2 関数一覧から） | 　個 |
-| グローバル変数の合計バイト数（2-1 SRAM確認から） | 　B |
+| 作品タイトル | 簡易安全扇風機 |
+| 状態の種類（1-2 状態遷移から） | 4種類（待機中・動作中・停止中・エラー） |
+| 実装する関数の数（2-2 関数一覧から） | 7個（setup, loop, readButton, checkPassword, updateOutput, updateTimer, handleError） |
+| グローバル変数の合計バイト数 18B（2-1 SRAM確認から） |（currentState 2B, timerSec 2B, speed 1B, mode 1B, isAuth 1B, inputBuf[4] 4B, lastMillis 4B, debounce 2B） |
 
 ---
 
@@ -32,25 +32,61 @@
 > ここで設計した変数は、この後の関数設計でそのまま使います。
 
 ```
-【ピン定義】（basic_design.md 3-1 から転記）
-  PIN_BUTTON    = 2    // タクトスイッチ（INPUT_PULLUP）
-  PIN_LED_RED   = 9    // 赤LED
-  PIN_LED_GREEN = 10   // 緑LED
-  PIN_BUZZER    = 11   // パッシブブザー
 
-【状態管理】（basic_design.md 1-2 の状態名から転記）
-  currentState  : int = 0   // 0:待機 1:動作中 2:完了 3:エラー
+【ボタン設計・ピン定義】
 
-【タイマー（millis()用）】（basic_design.md 2-3 から転記）
-  lastMillis_LED    : unsigned long = 0
-  lastMillis_Sensor : unsigned long = 0
+  // --- 4x4テンキーパッド仕様 ---
+  4x4テンキーパッド（16キー）を使用し、以下の割り当てとする：
+  [1] [2] [3] [A]
+  [4] [5] [6] [B]
+  [7] [8] [9] [C]
+  [*] [0] [#] [D]
 
-【センサー・入力値】（basic_design.md 2-1 から転記）
-  sensorValue   : int  = 0
-  buttonState   : bool = false
+  - A：パスワード入力開始
+  - B：速度設定モード
+  - C：タイマー設定モード
+  - D：電源ON/OFF
+  - 0〜9, *, #：数値入力・確定
+
+  テンキーパッドは4本の行ピン（ROW0〜ROW3）と4本の列ピン（COL0〜COL3）で合計8ピンをArduinoに接続し、スキャン方式で入力を取得する。
+
+  PIN_MOTOR = 9    // モーター制御
+  PIN_LED   = 10   // 状態表示LED
+
+【定数】
+
+【定数】
+  PASSWORD_LENGTH     : const int = 4
+  PASSWORD_CORRECT[]  : const char[5] = "1234" // 例
+  TIMER_MIN           : const int = 1
+  TIMER_MAX           : const int = 300
+  SPEED_MIN           : const int = 0
+  SPEED_MAX           : const int = 9
+
+
+
+【状態管理】
+  currentState   : int = 0      // 0:待機 1:動作 2:停止 3:エラー（2B）
+  timerSec       : int = 0      // 残り秒数（2B）
+  speed          : char = 0     // 速度（1B）
+  mode           : char = 1     // 入力モード（1B）1:パスワード入力から開始
+  isAuth         : bool = false // 認証状態（1B）
+  inputBuf[4]    : char[4] = "" // 入力バッファ（4B）
+  lastMillis     : unsigned long = 0 // タイマー・デバウンス共用（4B）
+  debounce       : int = 0      // デバウンス用（2B）
+
+
+【タイマー（millis()用）】
+  lastMillis_Timer    : unsigned long = 0
+  lastMillis_Input    : unsigned long = 0
+
+
+【チャタリング防止：ボタンを押したとき１回だけ押したことにする】
+  lastDebounceTime    : unsigned long = 0
+  DEBOUNCE_DELAY      : const int = 50
 
 【その他のフラグ・カウンター】
-  （自分のものを追加）
+  // 必要に応じて追加
 ```
 
 ---
@@ -83,9 +119,24 @@
 **↓ 自分の setup() を設計してください**
 ```
 【処理の流れ】
-1.
-2.
-3.
+
+1. 各ボタンピンの初期化
+  - A/B/C/D/0-9/*/# すべて INPUT_PULLUP で設定
+
+2. 出力ピンの初期化
+  - モーター、LEDを OUTPUT で設定
+
+3. シリアル通信の開始
+  - Serial.begin(9600)（デバッグ用）
+
+4. 起動確認
+  - LEDを1秒点灯→消灯
+
+5. 状態変数のリセット
+  - currentState=0, timerSec=0, speed=0, mode=1（パスワード入力モードで開始）, isAuth=false, inputBuf="", lastMillis=0, debounce=0
+
+6. システム起動直後は必ずパスワード入力モード（mode=1）から開始し、正しいパスワードが入力されるまで他の操作は受け付けない。
+7. パスワード入力前（mode=1）でA以外のボタン（B/C/D/数字/記号など）が押された場合は、LEDを一瞬点滅させて「無効操作だった」ことをユーザーにフィードバックする。
 ```
 
 ---
@@ -122,16 +173,34 @@
 【処理の流れ】
 
 ＜毎ループ実行すること＞
+  - 各ボタンの入力を読む（debounce付き）
+  - 現在時刻を取得: now = millis()
+  - 1秒ごとにタイマー減算処理（powerOnかつtimerRemainingSec>0のときtimerRemainingSec--）
 
+＜inputMode = 0（NONE）のとき＞
+  - A/B/C/D/数字/記号キーの押下を判定し、各モードへ遷移
 
-＜currentState が 　　 のとき＞
+＜inputMode = 1（PASSWORD）のとき＞
+  - 数字キーでinputBufferに追加
+  - *でinputBufferクリア
+  - #で4桁判定→認証
 
+＜inputMode = 2（SPEED）のとき＞
+  - 数字キーでinputBufferに追加
+  - *でinputBufferクリア
+  - #で0〜9に補正してspeedLevelへ反映
 
-＜currentState が 　　 のとき＞
+＜inputMode = 3（TIMER）のとき＞
+  - 数字キーでinputBufferに追加
+  - *でinputBufferクリア
+  - #で1〜300に補正してtimerMinutesへ反映、timerRemainingSecをセット
 
+＜powerOn = true のとき＞
+  - モーターON、速度反映
+  - timerRemainingSec==0でpowerOn=false
 
-＜currentState が 　　 のとき＞
-
+＜powerOn = false のとき＞
+  - モーターOFF
 ```
 
 ---
@@ -152,12 +221,19 @@
 
 ```
 【処理の流れ】
-1.
-2.
-3.
+
+1. 入力値（引数）の妥当性を確認する（範囲・型・NULLチェックなど）
+2. 必要なグローバル変数や状態を参照し、処理に必要な初期化を行う
+3. メインの処理ロジックを実行する（例：入力値に応じて状態を更新、出力を制御など）
+4. 必要に応じて外部デバイス（LED, モーター, LCD等）を制御する
+5. 結果を返す、またはグローバル変数・出力に反映する
+6. デバッグ用にSerial.println等で状態を出力（任意）
 
 【エラー・異常ケース】
-- 異常な値が来た場合:
+- 入力値が範囲外・NULL・不正な型の場合：LEDを一瞬点滅させる、入力バッファをクリア、エラーコードを返す等の対処を行う
+- 状態遷移が不正な場合：何も処理せずリターン、またはエラー表示
+- 外部デバイス制御に失敗した場合：エラーLED点灯などでユーザーに通知
+- 連続エラーやロック条件に該当した場合：一定時間操作を受け付けない（ロック状態に遷移）
 ```
 
 ---
@@ -211,11 +287,19 @@
 
 ```
 【処理の流れ】
-1.
-2.
-3.
+1. パスワード確定（#押下）時に、入力4桁が不一致なら failCount を +1 する。
+2. failCount が 3 回に到達したら lockUntilMillis = now + 30000 を設定し、入力ロック状態にする（30秒）。
+3. 入力ロック中は A/B/C/D/数字/*/# を受け付けず、now >= lockUntilMillis になったら failCount を 0 に戻してロック解除する。
 
 【入力値と出力値の関係】
+
+- 入力: inputBuffer（4桁）, PASSWORD_CORRECT, now, failCount
+- 出力: isAuthenticated, failCount, lockUntilMillis, powerOn
+- 判定:
+  - 4桁一致: isAuthenticated=true, failCount=0
+  - 4桁不一致かつ failCount<3: isAuthenticated=false, failCountを加算
+  - 4桁不一致かつ failCount=3到達: lockUntilMillisを設定し、操作を一時停止
+  - ロック中: powerOnは変更不可（未認証のまま）
 
 ```
 
@@ -256,7 +340,7 @@
 | No | テスト対象の関数 | 入力・操作 | 期待する結果 | 実際の結果 | 合否 |
 |:---|:---|:---|:---|:---|:---|
 | 1 | updateOutput(0) | state=0（待機中）を渡す | 緑LEDが点滅する | | [ ] |
-| 2 | updateOutput(1) | state=1（動作中）を渡す | 赤LEDが点灯、ブザーが鳴る | | [ ] |
+| 2 | updateOutput(1) | state=1（動作中）を渡す | 赤LEDが点灯 | | [ ] |
 | 3 | （自分の状態・関数を追加） | | | | [ ] |
 
 ### 5-3. タイミング・並行動作テスト
