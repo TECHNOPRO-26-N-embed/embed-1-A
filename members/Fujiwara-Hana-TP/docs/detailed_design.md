@@ -1,6 +1,6 @@
 # 詳細設計書 — 組込み開発実習
 
-<!-- 作成者: あなたの名前 / 日付: YYYY-MM-DD / グループ: 〇-〇 -->
+<!-- 作成者: 藤原羽花 / 日付: 2026-05-25 / グループ: 1-A -->
 
 > **このドキュメントの目的**
 > 基本設計書（basic_design.md）で「**どのような構造で作るか**」を決めました。
@@ -19,10 +19,10 @@
 
 | 項目 | basic_design.md から転記 |
 |:--|:--|
-| 作品タイトル | |
-| 状態の種類（1-2 状態遷移から） | |
-| 実装する関数の数（2-2 関数一覧から） | 　個 |
-| グローバル変数の合計バイト数（2-1 SRAM確認から） | 　B |
+| 作品タイトル | プロペラの風量を選択できるボタン |
+| 状態の種類（1-2 状態遷移から） | 0:待機中, 1:入力判定中, 2:回転速度制御中, 3:異常入力時 |
+| 実装する関数の数（2-2 関数一覧から） | 10個（setup, loop, readKeypad, validateInput, convertToPwm, applyFanSpeed, printStatus, handleSpeedInput, handleStopRequest, updateFanSpeedByLevel） |
+| グローバル変数の合計バイト数（2-1 SRAM確認から） | 約12B（int×2, bool×1, unsigned long×2, 他） |
 
 ---
 
@@ -33,24 +33,31 @@
 
 ```
 【ピン定義】（basic_design.md 3-1 から転記）
-  PIN_BUTTON    = 2    // タクトスイッチ（INPUT_PULLUP）
-  PIN_LED_RED   = 9    // 赤LED
-  PIN_LED_GREEN = 10   // 緑LED
-  PIN_BUZZER    = 11   // パッシブブザー
+
+// キーパッド（4x4）
+const int PIN_KEYPAD_ROW[4] = {2, 3, 4, 5};   // Row: D2-D5
+const int PIN_KEYPAD_COL[4] = {6, 7, 8, 9};   // Col: D6-D9
+// DCモーター制御
+const int PIN_MOTOR_PWM = 10;                  // D10 (PWM出力)
+
+// 必要に応じてLEDやブザーを追加する場合
+// const int PIN_LED_RED   = 9;    // 赤LED（未使用ならコメントアウト）
+// const int PIN_LED_GREEN = 10;   // 緑LED（未使用ならコメントアウト）
+// const int PIN_BUZZER    = 11;   // パッシブブザー（未使用ならコメントアウト）
 
 【状態管理】（basic_design.md 1-2 の状態名から転記）
-  currentState  : int = 0   // 0:待機 1:動作中 2:完了 3:エラー
+int currentState = 0;       // 0:待機 1:入力判定中 2:回転速度制御中 3:異常入力時
 
 【タイマー（millis()用）】（basic_design.md 2-3 から転記）
-  lastMillis_LED    : unsigned long = 0
-  lastMillis_Sensor : unsigned long = 0
+unsigned long lastMillis = 0;      // 汎用タイマー（入力監視・表示更新など）
 
 【センサー・入力値】（basic_design.md 2-1 から転記）
-  sensorValue   : int  = 0
-  buttonState   : bool = false
+char keyInput = '\0';             // キーパッドからの入力値（0-9, A-D, *, #）
+int pwmValue = 0;                  // ファン制御用のPWM値（0-255）
+int lastValidValue = 0;            // 直前の有効な入力値
 
 【その他のフラグ・カウンター】
-  （自分のものを追加）
+bool errorFlag = false;            // 無効入力や異常値の検出フラグ
 ```
 
 ---
@@ -83,9 +90,11 @@
 **↓ 自分の setup() を設計してください**
 ```
 【処理の流れ】
-1.
-2.
-3.
+1. キーパッドのピン（Row/Col）をINPUT/OUTPUTで初期化
+2. モーターPWMピンをOUTPUTで初期化
+3. シリアル通信（9600bps）を開始
+4. 変数を初期値にリセット
+5. 起動確認のため、シリアルに"起動"と表示
 ```
 
 ---
@@ -122,21 +131,146 @@
 【処理の流れ】
 
 ＜毎ループ実行すること＞
+  - 現在時刻を取得: now = millis()
 
+＜currentState が 0（待機中）のとき＞
+  - handleSpeedInput() を呼び、入力段階を取得する
+  - 戻り値が0〜9なら currentState = 1
 
-＜currentState が 　　 のとき＞
+＜currentState が 1（入力判定中）のとき＞
+  - 入力段階が0〜9なら currentState = 2
+  - それ以外なら currentState = 3
 
+＜currentState が 2（回転速度制御中）のとき＞
+  - handleStopRequest(level) を呼ぶ
+  - level が 0 でなければ updateFanSpeedByLevel(level) を呼ぶ
+  - level が 0 なら currentState = 0
 
-＜currentState が 　　 のとき＞
-
-
-＜currentState が 　　 のとき＞
+＜currentState が 3（異常入力時）のとき＞
+  - モーター停止（applyFanSpeed(0)）
+  - エラー内容をシリアルに表示（printStatus）
+  - 有効な入力があれば currentState = 1
 
 ```
 
 ---
 
 ### （関数ごとに以下のブロックをコピーして追加してください）
+
+### `readKeypad()` — キーパッドから1文字入力を取得する
+**basic_design.md 2-2 との対応：** キーパッドからの入力取得
+**引数：** なし
+**戻り値：** char（入力値）
+// 呼び出し元: handleSpeedInput()
+// 呼び出しタイミング: 入力段階の取得時（currentState=0,1）
+```
+【処理の流れ】
+1. キーパッドの各行・列をスキャン
+2. 押されているキーがあれば、その値を返す
+3. 押されていなければ '\0' を返す
+
+【エラー・異常ケース】
+- 複数キー同時押し時は最初に検出したキーのみ返す
+```
+
+### `validateInput()` — 入力が0〜9の有効値かを判定する
+**basic_design.md 2-2 との対応：** 入力判定
+**引数：** key（char）: 入力値
+**戻り値：** bool（有効ならtrue）
+// 呼び出し元: handleSpeedInput()
+// 呼び出しタイミング: 入力値の有効性判定時（currentState=0,1）
+```
+【処理の流れ】
+1. keyが'0'〜'9'のいずれかか判定
+2. 有効ならtrue、不正ならfalseを返す
+
+【エラー・異常ケース】
+- '*'や'#'など無効値はfalse
+```
+
+### `convertToPwm()` — 段階値（0〜9）をPWM値（0〜255）へ変換する
+**basic_design.md 2-2 との対応：** PWM変換
+**引数：** level（int）: 段階値
+**戻り値：** int（PWM値）
+// 呼び出し元: updateFanSpeedByLevel()
+// 呼び出しタイミング: 段階値からPWM値へ変換する時（currentState=2）
+```
+【処理の流れ】
+1. 0〜9の段階値を0〜255のPWM値に均等割り当てする（10段階）
+2. 具体的には map(level, 0, 9, 0, 255) を使う
+  - 例: 0→0, 1→28, 2→56, ..., 9→255
+3. levelが範囲外（0未満/9超）の場合は0を返す
+
+【エラー・異常ケース】
+- 範囲外（0未満/9超）は0を返す
+```
+
+### `applyFanSpeed()` — PWM値を出力してファン回転速度を反映する
+**basic_design.md 2-2 との対応：** モーター制御
+**引数：** pwm（int）: PWM値
+**戻り値：** なし
+// 呼び出し元: updateFanSpeedByLevel(), handleStopRequest(), loop()（異常時）
+// 呼び出しタイミング: PWM出力時、ファン停止時、異常入力時（currentState=2,3）
+```
+【処理の流れ】
+1. PWM値をD10ピンに出力
+2. 0ならモーター停止
+
+【エラー・異常ケース】
+ - PWM値が0未満なら0、255を超えたら255として出力する
+```
+
+### `printStatus()` — 現在段階またはエラー内容をシリアルに表示する
+**basic_design.md 2-2 との対応：** 表示更新
+**引数：** level（int）, isError（bool）
+**戻り値：** なし
+// 呼び出し元: updateFanSpeedByLevel(), loop()（異常時）
+// 呼び出しタイミング: 状態・エラー表示時（currentState=2,3）
+```
+【処理の流れ】
+1. isError=falseなら "現在段階: level" をシリアル出力
+2. isError=trueなら "エラー: 無効な入力" をシリアル出力
+```
+
+### `handleSpeedInput()` — 数字入力を読み取り、目標段階を更新する
+**basic_design.md 2-2 との対応：** キーパッド数字入力で0〜9段階指定
+**引数：** なし
+**戻り値：** int（入力段階）
+// 呼び出し元: loop()
+// 呼び出しタイミング: 入力待機時（currentState=0）
+```
+【処理の流れ】
+1. readKeypadで入力取得
+2. validateInputで有効性判定
+3. 有効なら level = key - '0' で数値へ変換して返す
+4. 無効なら-1を返す
+```
+
+### `handleStopRequest()` — 入力が0のときPWM=0を設定して停止する
+**basic_design.md 2-2 との対応：** 0入力でファン停止
+**引数：** level（int）
+**戻り値：** なし
+// 呼び出し元: loop()
+// 呼び出しタイミング: 回転速度制御中にlevel=0が入力された時（currentState=2）
+```
+【処理の流れ】
+1. level==0ならapplyFanSpeed(0)を呼ぶ
+2. シリアルに"ファン停止"を表示
+```
+
+### `updateFanSpeedByLevel()` — 入力段階に応じて速度を即時変更する
+**basic_design.md 2-2 との対応：** 入力段階に応じた即時速度変更
+**引数：** level（int）
+**戻り値：** なし
+// 呼び出し元: loop()
+// 呼び出しタイミング: 回転速度制御中にlevel≠0が入力された時（currentState=2）
+```
+【処理の流れ】
+1. convertToPwmでPWM値に変換
+2. applyFanSpeedで出力
+3. printStatusで現在段階を表示
+```
+
 
 > ※ 基本設計書 2-2 の関数一覧に記載した関数を1つずつ設計します。
 
@@ -170,18 +304,21 @@
 
 ```
 【考え方】
-  ボタンが押されたとき、50ms 以内の連続入力は「同じ1回の押下」として無視する。
+  キーパッド入力を20ms周期で監視し、同じキーの短時間連続検出を1回として扱う。
+  これにより、押下時の揺れや連打による誤入力を防ぐ。
 
 【処理の流れ】
-  1. ボタンのデジタル値を読む（digitalRead）
-  2. 前回確定した時刻（lastDebounceTime）からの経過時間を計算する
-  3. 経過時間 < DEBOUNCE_DELAY（例: 50ms）→ 無視する
-  4. 経過時間 ≥ DEBOUNCE_DELAY → ボタンの状態として確定する
-  5. lastDebounceTime を更新する
+  1. now = millis() を取得する
+  2. now - lastMillis が 20ms 未満なら、今回の入力判定をスキップする
+  3. 20ms 以上なら readKeypad() でキー入力を1回取得する
+  4. 前回入力値と同一キーが連続している場合は、必要に応じて無視する
+  5. 有効入力（0〜9）のときだけ状態遷移・速度変更処理へ渡す
+  6. lastMillis = now に更新する
 
 【必要な変数（Section 1 に追加済みか確認）】
-  lastDebounceTime : unsigned long   // 前回確定した時刻
-  DEBOUNCE_DELAY   : const int = 50  // チャタリング判定時間（ms）
+  lastMillis : unsigned long          // 前回入力判定を行った時刻
+  keyInput   : char                   // 今回取得したキー入力
+  lastValidValue : int                // 直前の有効入力段階
 ```
 
 ---
@@ -190,16 +327,21 @@
 
 ```
 【考え方】
-  「前回実行した時刻」を記録しておき、「今の時刻 − 前回時刻 ≥ 周期」なら実行する。
+  delay() を使わず、入力監視と表示更新を止めないために millis() で周期管理する。
+  「今の時刻 - 前回時刻」が所定周期以上のときだけ処理を実行する。
 
-【処理の流れ（例: LED点滅）】
+【処理の流れ（本システム）】
   1. now = millis()
-  2. now - lastMillis_LED >= LED_INTERVAL かどうか確認
-  3. 条件を満たした場合: LEDのON/OFFを切り替え、lastMillis_LED = now
-  4. 条件を満たさない場合: 何もしない（次のループで再チェック）
+  2. now - lastMillis >= 20ms かどうか確認（キーパッド監視周期）
+  3. 条件を満たす場合のみ readKeypad() と validateInput() を実行
+  4. 入力が有効なら convertToPwm() と applyFanSpeed() を実行
+  5. printStatus() で現在段階またはエラー内容を表示
+  6. 処理後に lastMillis = now へ更新
+  7. 条件を満たさない場合は何もしないで次ループへ進む
 
 【自分のシステムで millis() を使う処理】
-  （basic_design.md 2-3 のタイミング設計から転記して具体化する）
+  - キーパッド入力読み取り: 20ms周期
+  - 基本は1つのタイマーで管理し、シリアル表示を一定周期で更新したい場合のみ表示用タイマーを追加する
 ```
 
 ---
@@ -210,13 +352,8 @@
 > 例：「距離に応じたLED点灯パターン」「ゲームの衝突判定」「温度の閾値判定」
 
 ```
-【処理の流れ】
-1.
-2.
-3.
-
-【入力値と出力値の関係】
-
+本システムでは、Section 2 と 3-1/3-2 で主要ロジックを網羅できているため、
+追加で分離すべき複雑なロジックはなし。
 ```
 
 ---
@@ -229,10 +366,15 @@
 
 | No | 確認したい内容 | 挿入する関数 | Serial.println の内容例 |
 |:---|:---|:---|:---|
-| 1 | センサー値が正しく取れているか | `readSensor()` | `Serial.println(sensorValue);` |
-| 2 | 状態遷移が正しく起きているか | `loop()` | `Serial.println(currentState);` |
-| 3 | チャタリング処理が効いているか | `readButton()` | `Serial.println("btn confirmed");` |
-| 4 |  |  |  |
+| 1 | キーパッド入力が正しく取得できているか | `readKeypad()` | `Serial.println(keyInput);` |
+| 2 | 入力判定が想定どおりか（0〜9のみ有効） | `validateInput()` | `Serial.println("valid=" + String(isValid));` |
+| 3 | 段階値からPWM値への変換が正しいか | `convertToPwm()` | `Serial.println("level=" + String(level) + ", pwm=" + String(pwmValue));` |
+| 4 | 状態遷移が正しく起きているか | `loop()` | `Serial.println("state=" + String(currentState));` |
+| 5 | 異常入力時に停止・エラー表示できているか | `printStatus()` | `Serial.println("error: invalid input");` |
+
+**デバッグ出力の削除方針（実装後）**
+- 常時監視用に一時追加した `Serial.println()` は、単体テスト完了後に削除する。
+- 最終版で残す出力は、仕様上必要な表示（現在段階・エラー表示）のみとする。
 
 ---
 
@@ -245,26 +387,36 @@
 
 | No | テスト対象の関数 | 入力・操作 | 期待する結果 | 実際の結果 | 合否 |
 |:---|:---|:---|:---|:---|:---|
-| 1 | readButton() | タクトスイッチを1回押す | true が返る | | [ ] |
-| 2 | readButton() | スイッチを素早く2回押す | 1回分だけ true になる | | [ ] |
-| 3 | readSensor() | センサーを正常範囲で使う | 仕様範囲内の値が返る | | [ ] |
-| 4 | readSensor() | センサーを遮蔽・範囲外に向ける | 誤動作しない | | [ ] |
-| 5 | （自分の関数を追加） | | | | [ ] |
+| 1 | readKeypad() | キーパッドで「3」を1回押す | 戻り値が '3' になる | | [ ] |
+| 2 | readKeypad() | 何も押さない状態で呼ぶ | 戻り値が '\0' になる | | [ ] |
+| 3 | validateInput() | '0', '5', '9' を入力する | すべて true を返す | | [ ] |
+| 4 | validateInput() | 'A', '*', '#' を入力する | すべて false を返す | | [ ] |
+| 5 | handleSpeedInput() | 数字キー「7」を入力する | 戻り値が 7 になる | | [ ] |
+| 6 | handleSpeedInput() | 無効キー「A」を入力する | 戻り値が -1 になる | | [ ] |
+| 7 | handleSpeedInput() | 'A','*'を連続入力 | いずれも-1を返し、currentState=3になる | | [ ] |
 
 ### 5-2. 出力系テスト
 
 | No | テスト対象の関数 | 入力・操作 | 期待する結果 | 実際の結果 | 合否 |
 |:---|:---|:---|:---|:---|:---|
-| 1 | updateOutput(0) | state=0（待機中）を渡す | 緑LEDが点滅する | | [ ] |
-| 2 | updateOutput(1) | state=1（動作中）を渡す | 赤LEDが点灯、ブザーが鳴る | | [ ] |
-| 3 | （自分の状態・関数を追加） | | | | [ ] |
+| 1 | convertToPwm() | level=0 を渡す | 戻り値が 0 になる | | [ ] |
+| 2 | convertToPwm() | level=9 を渡す | 戻り値が 255 になる | | [ ] |
+| 3 | convertToPwm() | level=-1, 10 を渡す | どちらも 0 を返す | | [ ] |
+| 4 | applyFanSpeed() | pwm=-10, 300 を渡す | 出力がそれぞれ 0, 255 に補正される | | [ ] |
+| 5 | handleStopRequest() | level=0 を渡す | モーターが停止し「ファン停止」が表示される | | [ ] |
+| 6 | updateFanSpeedByLevel() | level=4 を渡す | PWM出力が更新され、現在段階が表示される | | [ ] |
+| 7 | printStatus() | isError=true で呼ぶ | 「エラー: 無効な入力」が表示される | | [ ] |
+| 8 | printStatus() | isError=trueで複数回呼ぶ | 毎回「エラー: 無効な入力」が表示される | | [ ] |
 
 ### 5-3. タイミング・並行動作テスト
 
 | No | テスト内容 | テスト手順 | 期待する結果 | 実際の結果 | 合否 |
 |:---|:---|:---|:---|:---|:---|
-| 1 | delay()による処理停止がないか | LED点滅中にボタンを押す | ボタン入力が無視されない | | [ ] |
-| 2 | millis()タイマーの周期精度 | 点滅をストップウォッチで確認 | 設計した周期（例:500ms）通りに点滅 | | [ ] |
+| 1 | 20ms周期の入力監視 | キーを短時間で連打してログを確認する | 20ms未満の連続入力はスキップされる | | [ ] |
+| 2 | 状態遷移の応答性 | 1→5→9→0 を連続入力する | 入力ごとに速度が更新され、0で停止する | | [ ] |
+| 3 | 100ms表示更新の確認（適用時） | 表示更新を100ms周期で実装してログ間隔を確認する | おおむね100ms間隔で表示更新される | | [ ] |
+| 4 | チャタリング時の異常入力 | 20ms未満で'A'や'*'を連打 | すべて無効入力として処理され、currentState=3が維持される | | [ ] |
+| 5 | 境界値からの復帰 | level=9のあとにlevel=0を入力 | 9で最大速度、0で停止しcurrentState=0に戻る | | [ ] |
 
 ---
 
@@ -277,8 +429,14 @@
 > 「この詳細設計書に書いた関数と処理フローをもとに Arduino でコードを書きます。バグになりやすい箇所・処理の抜け・型の問題はありますか？」
 
 **AIの回答（要約）：**
+- 型の大枠は妥当（millis 系は unsigned long で問題なし）
+- ただし「状態定義の統一」と「char→int変換の明記」は優先して直すべきです。
 
 **対応した内容：**
+- 状態定義を待機中・入力判定中・回転速度制御中・異常入力時の4状態に統一した。
+- 文字入力を数値に変換する手順（key - '0'）を関数手順へ明記した。
+- loopは状態分岐と関数呼び出しに責務を限定する方針へ整理した。
+- 基本ひとつで、シリアル表示を一定周期で更新したい場合のみ表示用タイマーを追加する方針へ整理した。
 
 ---
 
@@ -286,9 +444,9 @@
 
 > 「Section 5 の単体テスト仕様書で、各関数の動作が正しく検証できていますか？テストが不足している項目や、境界値テストが必要な箇所を教えてください。」
 
-**AIの回答（要約）：**
+**AIの回答（要約）：** 全体として、基本・境界・異常の3観点でバランスは良いですが、異常系の分岐や連続動作のテストをもう少し増やすと万全です。
 
-**対応した内容：**
+**対応した内容：** 異常系（無効入力時の状態遷移・エラー表示）、連続動作（チャタリング時の無効入力）、境界値（最大値・最小値付近の動作）に関するテスト項目をSection 5に追加し、テーブルに明示した。
 
 ---
 
@@ -309,4 +467,4 @@
 
 ---
 
-*初版: YYYY-MM-DD / AIレビュー: YYYY-MM-DD / グループレビュー後更新: YYYY-MM-DD*
+*初版: 2026-05-25 / AIレビュー: 2026-05-25 / グループレビュー後更新: 2026-05-25*
