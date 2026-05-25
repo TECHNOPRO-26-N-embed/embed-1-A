@@ -40,25 +40,43 @@ const int PIN_KEYPAD_COL[4] = {6, 7, 8, 9};   // Col: D6-D9
 // DCモーター制御
 const int PIN_MOTOR_PWM = 10;                  // D10 (PWM出力)
 
-// 必要に応じてLEDやブザーを追加する場合
-// const int PIN_LED_RED   = 9;    // 赤LED（未使用ならコメントアウト）
-// const int PIN_LED_GREEN = 10;   // 緑LED（未使用ならコメントアウト）
+// 必要に応じてブザーを追加する場合
 // const int PIN_BUZZER    = 11;   // パッシブブザー（未使用ならコメントアウト）
+
 
 【状態管理】（basic_design.md 1-2 の状態名から転記）
 int currentState = 0;       // 0:待機 1:入力判定中 2:回転速度制御中 3:異常入力時
 
 【タイマー（millis()用）】（basic_design.md 2-3 から転記）
-unsigned long lastMillis = 0;      // 汎用タイマー（入力監視・表示更新など）
+unsigned long lastMillis = 0;      // 汎用タイマー（入力監視のみ）
 
 【センサー・入力値】（basic_design.md 2-1 から転記）
 char keyInput = '\0';             // キーパッドからの入力値（0-9, A-D, *, #）
+int currentLevel = -1;             // 現在保持している入力段階（-1: 未入力/無効）
 int pwmValue = 0;                  // ファン制御用のPWM値（0-255）
 int lastValidValue = 0;            // 直前の有効な入力値
 
 【その他のフラグ・カウンター】
 bool errorFlag = false;            // 無効入力や異常値の検出フラグ
 ```
+### 使用ピン一覧（用途まとめ）
+
+| ピン | 用途 | 方向 | 通常値/備考 |
+|:---|:---|:---|:---|
+| D2 | キーパッド Row0 | 出力（スキャン） | 4x4キーパッド行線 |
+| D3 | キーパッド Row1 | 出力（スキャン） | 4x4キーパッド行線 |
+| D4 | キーパッド Row2 | 出力（スキャン） | 4x4キーパッド行線 |
+| D5 | キーパッド Row3 | 出力（スキャン） | 4x4キーパッド行線 |
+| D6 | キーパッド Col0 | 入力 | 4x4キーパッド列線 |
+| D7 | キーパッド Col1 | 入力 | 4x4キーパッド列線 |
+| D8 | キーパッド Col2 | 入力 | 4x4キーパッド列線 |
+| D9 | キーパッド Col3 | 入力 | 4x4キーパッド列線 |
+| D10 | DCモーターPWM | 出力（PWM） | 0〜255で速度制御 |
+| D11 | 予備（ブザー） | 未使用 | 将来拡張用（必要時のみ有効化） |
+
+**ピン設計ルール**
+- 未使用ピンは初期化せず、コメントで予約用途を明記する。
+- 拡張用ピンを有効化する場合は、Section 1 のピン定義と上記一覧を同時に更新する。
 
 ---
 
@@ -90,11 +108,13 @@ bool errorFlag = false;            // 無効入力や異常値の検出フラグ
 **↓ 自分の setup() を設計してください**
 ```
 【処理の流れ】
-1. キーパッドのピン（Row/Col）をINPUT/OUTPUTで初期化
-2. モーターPWMピンをOUTPUTで初期化
-3. シリアル通信（9600bps）を開始
-4. 変数を初期値にリセット
-5. 起動確認のため、シリアルに"起動"と表示
+1. キーパッド行ピン D2-D5（PIN_KEYPAD_ROW）を OUTPUT に設定する
+2. キーパッド列ピン D6-D9（PIN_KEYPAD_COL）を INPUT に設定する
+3. モーターPWMピン D10（PIN_MOTOR_PWM）を OUTPUT に設定する
+4. 予備ピン D11（PIN_BUZZER）は未使用のため初期化しない
+5. シリアル通信（9600bps）を開始する
+6. 変数（currentState, keyInput, currentLevel, pwmValue, lastValidValue, errorFlag, lastMillis）を初期値にリセットする
+7. 起動確認のため、シリアルに"起動"と表示する
 ```
 
 ---
@@ -130,26 +150,33 @@ bool errorFlag = false;            // 無効入力や異常値の検出フラグ
 ```
 【処理の流れ】
 
+※ 方針: 入力取得と妥当性判定は currentState=0 で完結させる。currentState=1 は処理フローを可視化するための中継状態として残す。
+
 ＜毎ループ実行すること＞
   - 現在時刻を取得: now = millis()
 
 ＜currentState が 0（待機中）のとき＞
-  - handleSpeedInput() を呼び、入力段階を取得する
-  - 戻り値が0〜9なら currentState = 1
+  - currentLevel = handleSpeedInput() を実行する
+  - currentLevel が0〜9なら currentState = 1
+  - currentLevel が-1（無効入力）なら currentState = 3
+  - currentLevel が-2（未入力）なら currentState は 0 のまま維持する
 
 ＜currentState が 1（入力判定中）のとき＞
-  - 入力段階が0〜9なら currentState = 2
-  - それ以外なら currentState = 3
+  - 状態0で入力判定済みの currentLevel をそのまま採用する
+  - 再判定は行わず、currentState = 2 へ遷移する
 
 ＜currentState が 2（回転速度制御中）のとき＞
-  - handleStopRequest(level) を呼ぶ
-  - level が 0 でなければ updateFanSpeedByLevel(level) を呼ぶ
-  - level が 0 なら currentState = 0
+  - handleStopRequest(currentLevel) を呼ぶ
+  - currentLevel が 0 でなければ updateFanSpeedByLevel(currentLevel) を呼ぶ
+  - currentLevel が 0 なら currentState = 0
 
 ＜currentState が 3（異常入力時）のとき＞
   - モーター停止（applyFanSpeed(0)）
   - エラー内容をシリアルに表示（printStatus）
-  - 有効な入力があれば currentState = 1
+  - currentLevel = handleSpeedInput() を実行する
+  - currentLevel が0〜9なら errorFlag = false にして currentState = 1
+  - currentLevel が-1（無効入力）なら currentState は 3 のまま維持する
+  - currentLevel が-2（未入力）なら currentState は 3 のまま維持する
 
 ```
 
@@ -162,7 +189,7 @@ bool errorFlag = false;            // 無効入力や異常値の検出フラグ
 **引数：** なし
 **戻り値：** char（入力値）
 // 呼び出し元: handleSpeedInput()
-// 呼び出しタイミング: 入力段階の取得時（currentState=0,1）
+// 呼び出しタイミング: 入力段階の取得時（currentState=0,3）
 ```
 【処理の流れ】
 1. キーパッドの各行・列をスキャン
@@ -178,7 +205,7 @@ bool errorFlag = false;            // 無効入力や異常値の検出フラグ
 **引数：** key（char）: 入力値
 **戻り値：** bool（有効ならtrue）
 // 呼び出し元: handleSpeedInput()
-// 呼び出しタイミング: 入力値の有効性判定時（currentState=0,1）
+// 呼び出しタイミング: 入力値の有効性判定時（currentState=0,3）
 ```
 【処理の流れ】
 1. keyが'0'〜'9'のいずれかか判定
@@ -235,15 +262,16 @@ bool errorFlag = false;            // 無効入力や異常値の検出フラグ
 ### `handleSpeedInput()` — 数字入力を読み取り、目標段階を更新する
 **basic_design.md 2-2 との対応：** キーパッド数字入力で0〜9段階指定
 **引数：** なし
-**戻り値：** int（入力段階）
+**戻り値：** int（入力段階。0〜9:有効入力, -1:無効入力, -2:未入力）
 // 呼び出し元: loop()
-// 呼び出しタイミング: 入力待機時（currentState=0）
+// 呼び出しタイミング: 入力待機時と異常入力からの復帰判定時（currentState=0,3）
 ```
 【処理の流れ】
 1. readKeypadで入力取得
-2. validateInputで有効性判定
-3. 有効なら level = key - '0' で数値へ変換して返す
-4. 無効なら-1を返す
+2. key が '\0'（未入力）の場合は -2 を返す
+3. validateInputで有効性判定
+4. 有効なら level = key - '0' で数値へ変換して返す
+5. 無効なら-1を返す
 ```
 
 ### `handleStopRequest()` — 入力が0のときPWM=0を設定して停止する
@@ -327,8 +355,8 @@ bool errorFlag = false;            // 無効入力や異常値の検出フラグ
 
 ```
 【考え方】
-  delay() を使わず、入力監視と表示更新を止めないために millis() で周期管理する。
-  「今の時刻 - 前回時刻」が所定周期以上のときだけ処理を実行する。
+  delay() を使わず、入力監視を止めないために millis() で周期管理する。
+  「今の時刻 - 前回時刻」が20ms以上のときだけ入力処理を実行する。
 
 【処理の流れ（本システム）】
   1. now = millis()
@@ -414,9 +442,8 @@ bool errorFlag = false;            // 無効入力や異常値の検出フラグ
 |:---|:---|:---|:---|:---|:---|
 | 1 | 20ms周期の入力監視 | キーを短時間で連打してログを確認する | 20ms未満の連続入力はスキップされる | | [ ] |
 | 2 | 状態遷移の応答性 | 1→5→9→0 を連続入力する | 入力ごとに速度が更新され、0で停止する | | [ ] |
-| 3 | 100ms表示更新の確認（適用時） | 表示更新を100ms周期で実装してログ間隔を確認する | おおむね100ms間隔で表示更新される | | [ ] |
-| 4 | チャタリング時の異常入力 | 20ms未満で'A'や'*'を連打 | すべて無効入力として処理され、currentState=3が維持される | | [ ] |
-| 5 | 境界値からの復帰 | level=9のあとにlevel=0を入力 | 9で最大速度、0で停止しcurrentState=0に戻る | | [ ] |
+| 3 | チャタリング時の異常入力 | 20ms未満で'A'や'*'を連打 | すべて無効入力として処理され、currentState=3が維持される | | [ ] |
+| 4 | 境界値からの復帰 | level=9のあとにlevel=0を入力 | 9で最大速度、0で停止しcurrentState=0に戻る | | [ ] |
 
 ---
 
@@ -456,13 +483,13 @@ bool errorFlag = false;            // 無効入力や異常値の検出フラグ
 
 | No | 指摘内容 | 指摘者 | 対応 |
 |:---|:---|:---|:---|
-| 1 |  |  |  |
+| 1 | 使用するピンをまとめておいたほうが分かりやすい | 関塚 | Section 1に追記 |
 | 2 |  |  |  |
 | 3 |  |  |  |
 
 ### 7-2. レビューを受けて変更した点
 
--
+- Section 1に使用ピン一覧を追記
 -
 
 ---
