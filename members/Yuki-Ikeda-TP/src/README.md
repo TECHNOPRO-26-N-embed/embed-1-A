@@ -20,9 +20,3 @@ password_led_judge.ino
 4. シリアルモニタを 9600bps で開く
 5. キーパッドで4桁入力後、`#` で判定する
 
-## ファイル例
-
-```
-unit1_hello.c
-unit2_led.ino
-```
