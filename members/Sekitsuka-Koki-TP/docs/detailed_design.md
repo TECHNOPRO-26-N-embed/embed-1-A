@@ -68,7 +68,8 @@
   lastDebounceTime : unsigned long = 0  // 前回確定した時刻（チャタリング防止用）
   DEBOUNCE_DELAY : const int = 50        // チャタリング判定時間（ms）
   KEYPAD_INTERVAL : const int = 10       // キーパッド読出周期（ms）
-  LED_STEP_INTERVAL : const int = 200    // 判定1桁表示時間（ms）
+  JUDGE_LED_ON_MS : const int = 1000      // 判定1桁の点灯時間（ms）
+  JUDGE_LED_OFF_MS : const int = 500      // 判定1桁の消灯間隔（ms）
   INVALID_BLINK_MS : const int = 500     // 不正入力通知時間（ms）
 ```
 
@@ -94,7 +95,7 @@
 2. D10〜D12 を OUTPUT に設定し、初期状態で消灯する。
 3. A0（任意ブザー）を OUTPUT に設定して停止状態にする。
 4. キーパッドライブラリを初期化し、Rows/Cols とキーマップを設定する。
-5. 乱数シードを初期化し、`generateSecretCode()` を呼び出す。
+5. 乱数シードを初期化し、`resetGame()` を呼び出す。
 6. 入力バッファ、判定結果、試行回数、タイマー値を初期化する。
 7. `currentState` を入力待ち（0）に設定する。
 ```
@@ -116,19 +117,18 @@
 3. 状態ごとに分岐する。
 
 ＜currentState が 0（入力待ち）のとき＞
-- 入力編集（数字追加、`#`削除）と `*` による判定開始を受け付ける。
+- 入力編集（数字追加、`*`削除）と `#` による判定開始を受け付ける。
 - 実際のキー処理は手順2の `handleInputKey(key)` で一元的に行う。
 
 ＜currentState が 1（判定表示）のとき＞
 - `updateLedOutput()` を周期実行し、`ledIndex` を進める。
 - `judgeDisplayDone == true`（4桁表示完了）になったら、完全一致なら 2（クリア）へ遷移する。
-- 不正解なら `attemptCount++` し、`checkAttemptLimit()` の結果で分岐。
-  - 上限未到達: 失敗演出後に 0（入力待ち）へ戻る。
-  - 上限到達: 失敗演出後に `resetGame()` を呼び、0（入力待ち）へ戻る。
+- 不正解なら `attemptCount >= MAX_ATTEMPTS` の結果で分岐。
+  - 上限未到達: 入力バッファをクリアして 0（入力待ち）へ戻る。
+  - 上限到達: `playGameOverEffect()`（赤LED点滅+低音）実行後に `resetGame()` を呼び、0（入力待ち）へ戻る。
 
 ＜currentState が 2（クリア）のとき＞
-- `playClearWave()` を実行する。
-- `*` 押下で `resetGame()` を呼び、新規ゲーム開始。
+- `playClearWave()` を実行し、演出完了後に `resetGame()` で新規ゲーム開始。
 
 ＜currentState が 3（ミス入力通知）のとき＞
 - `notifyInvalidInput()` で赤LED通知を実行する。
@@ -169,8 +169,8 @@
 ```
 【処理の流れ】
 1. `key` が数字（`'0'〜'9'`）なら `updateInputBuffer(key)` を呼ぶ。
-2. `key` が `#` なら `applyEditKey()` を呼ぶ。
-3. `key` が `*` なら `startJudgeIfReady()` を呼ぶ。
+2. `key` が `*` なら `applyEditKey()` を呼ぶ。
+3. `key` が `#` なら `startJudgeIfReady()` を呼ぶ。
 4. それ以外は無視する。
 ```
 
@@ -182,17 +182,19 @@
 
 **引数：** char key（入力されたキー）
 
-**戻り値：** bool（更新成功かどうか）
+**戻り値：** なし
 
 ```
 【処理の流れ】
 1. `inputLength >= 4` なら以下を実行:
+  - 警告音（低め2回）を鳴らす。
    - 赤LEDを短く点滅させる（入力制限通知）。
-   - false を返す。
+  - 処理を終了する。
 2. `key - '0'` を数値化し、`inputCode[inputLength]` に保存する。
 3. `inputLength++` する。
+4. 入力音（単音）を鳴らす。
 4. 入力確定のフィードバックとして緑LEDを短く点灯（任意）。
-5. true を返す。
+5. 処理を終了する。
 ```
 
 ---
@@ -212,7 +214,7 @@
 3. 2周目で未確定桁について「値一致・位置違い（黄=1）」を判定する。
 4. 上記に該当しない桁を「不一致（赤=0）」にする。
 5. 結果を `judgeResult[4]` に保存する。
-6. `ledIndex = 0`、`judgeDisplayDone = false`、`lastLedMillis = millis()`、`judgeStartMillis = millis()` を設定する。
+6. `ledIndex = 0`、`judgeDisplayDone = false`、`lastLedMillis = 0` を設定する。
 ```
 
 ---
@@ -227,15 +229,15 @@
 
 ```
 【処理の流れ】
-1. `now = millis()` を取得し、`now - lastLedMillis < LED_STEP_INTERVAL` なら何もしない。
-2. 3色LEDを一度消灯する。
-3. `judgeResult[ledIndex]` に応じて対象色のみ点灯する。
+1. `ledOnPhase` が true の場合、`now - lastLedMillis >= JUDGE_LED_ON_MS` まで待機する。
+2. 点灯時間満了後に3色LEDを消灯し、`ledOnPhase = false`、`lastLedMillis = now`、`ledIndex++` を実行する。
+3. `ledIndex >= 4` になったら `judgeDisplayDone = true` にし、表示を終了する。
+4. `ledOnPhase` が false の場合、`now - lastLedMillis >= JUDGE_LED_OFF_MS` で次の桁表示へ進む。
+5. `judgeResult[ledIndex]` に応じて対象色のみ点灯する。
   - 2: 緑LED点灯
   - 1: 黄LED点灯
   - 0: 赤LED点灯
-4. `lastLedMillis = now` に更新する。
-5. `ledIndex++` する。
-6. `ledIndex >= 4` になったら全LED消灯し、`judgeDisplayDone = true` にする。
+6. 点灯色に応じた判定音を鳴らし、`ledOnPhase = true`、`lastLedMillis = now` に更新する。
 ```
 
 ---
@@ -253,27 +255,9 @@
 1. `inputCode` と `judgeResult` を 0 でクリアする。
 2. `inputLength = 0`, `attemptCount = 0`, `ledIndex = 0`, `judgeDisplayDone = false` にする。
 3. 状態を `currentState = 0`（入力待ち）にする。
-4. `generateSecretCode()` を呼び、新しいゲームを開始する。
+4. 関数内で重複なし4桁を生成し、新しいゲームを開始する。
 5. 必要なら開始演出（緑短点灯など）を行う。
 ```
----
-
-### `generateSecretCode()` — ランダム正解コード生成
-
-**basic_design.md 2-2 との対応：** ランダム正解コード生成
-
-**引数：** なし
-
-**戻り値：** なし
-
-```
-【処理の流れ】
-1. 候補配列 `digits[10] = {0..9}` を用意する。
-2. Fisher-Yates 方式（配列を偏りなく並べ替える手法）でシャッフルする。
-3. 先頭4要素を `secretCode[0..3]` に格納する。
-4. デバッグ時のみシリアルに出力して確認する。
-```
-
 ---
 
 ### `applyEditKey()` — 入力編集
@@ -288,6 +272,7 @@
 【処理の流れ】
 1. `inputLength == 0` なら何もしない。
 2. `inputLength--` して末尾桁を 0 に戻す。
+3. 削除音（低めの単音1回）を鳴らす。
 3. 入力編集フィードバックとして黄LEDを短く点灯（任意）。
 ```
 
@@ -299,7 +284,7 @@
 
 **引数：** なし
 
-**戻り値：** bool（判定開始したかどうか）
+**戻り値：** なし
 
 ```
 【処理の流れ】
@@ -307,27 +292,10 @@
 2. true の場合:
   - `judgeAndStoreResult()` を呼ぶ。
   - `currentState = 1`（判定表示）に遷移する。
-  - true を返す。
 3. false の場合:
+  - 警告音（低め2回）を鳴らす。
   - `currentState = 3`（ミス入力通知）に遷移する。
   - 通知処理は `loop()` の state=3 分岐で開始・実行する。
-  - false を返す。
-```
-
----
-
-### `checkAttemptLimit()` — 上限判定
-
-**basic_design.md 2-2 との対応：** 上限判定
-
-**引数：** なし
-
-**戻り値：** bool（上限到達かどうか）
-
-```
-【処理の流れ】
-1. attemptCountが10以上か判定する。
-2. 10回に達していればtrue、未満ならfalseを返す。
 ```
 
 ---
@@ -379,24 +347,61 @@
 【処理の流れ】
 1. 赤→黄→緑の順で100msずつ点灯させる。
 2. 1サイクル終了後に全LEDを消灯する。
-3. サイクル数を制限（例: 3回）し、`*`入力で中断可能にする。
+3. サイクル数を制限（例: 3回）して再生し、完了後に `resetGame()` を呼ぶ。
 ```
 
 ---
 
-### `playBuzzerPattern(bool isClear)` — 任意: 成功/失敗音通知
+### `playGameOverEffect()` — 任意: ゲームオーバー演出
 
-**basic_design.md 2-2 との対応：** A01 任意: 成功/失敗音通知
+**basic_design.md 2-2 との対応：** 追加仕様（試行回数上限到達時の演出）
 
-**引数：** bool isClear（成功時 true / 失敗時 false）
+**引数：** なし
 
 **戻り値：** なし
 
 ```
 【処理の流れ】
-1. isClear=true の場合は高音2回、false の場合は低音1回を鳴らす。
-2. `tone()` と `millis()` を併用し、LED演出と独立して制御する。
-3. 演出完了後に `noTone(PIN_BUZZER)` を実行する。
+1. 赤LEDを点灯し、低音ブザーを鳴らす。
+2. 短い間隔で消灯・無音にする。
+3. 上記を3回繰り返し、ゲームオーバーを視覚/聴覚で通知する。
+4. 演出終了後に `resetGame()` へ処理を渡す。
+```
+
+---
+
+### `playClearTone()` — 任意: クリア音通知
+
+**basic_design.md 2-2 との対応：** A01 任意: 音通知（入力/警告/判定/クリア）
+
+**引数：** なし
+
+**戻り値：** なし
+
+```
+【処理の流れ】
+1. クリア時に「てっててー」の3音を鳴らす。
+2. 演出完了後に `noTone(PIN_BUZZER)` を実行する。
+```
+
+### `playInputTone()` / `playDeleteTone()` / `playWarningTone()` / `playJudgeTone(byte result)` — 任意: 操作/警告/判定音
+
+**basic_design.md 2-2 との対応：** A01 任意: 音通知（入力/警告/判定/クリア）
+
+**引数：** `playInputTone()` なし / `playDeleteTone()` なし / `playWarningTone()` なし / `playJudgeTone(byte result)` 判定色(2/1/0)
+
+**戻り値：** なし
+
+```
+【処理の流れ】
+1. `playInputTone()` は数字入力時に「ピッ」の単音を鳴らす。
+2. `playDeleteTone()` は1桁削除時に低めの単音を1回鳴らす。
+3. `playWarningTone()` は5桁目入力や4桁未満判定時に「ブッブッ」の低音2回を鳴らす。
+4. `playJudgeTone(result)` は判定色ごとに鳴らす。
+  - 緑(2): ピッピー（単音+伸ばしの2音）
+  - 黄(1): ピ（単音）
+  - 赤(0): ブッブー（低めの単音+伸ばしの2音）
+5. 各音の終了時に `noTone(PIN_BUZZER)` を実行する。
 ```
 
 ---
@@ -451,14 +456,14 @@
 
 【処理の流れ（例: LED点滅）】
   1. now = millis()
-  2. now - lastLedMillis >= LED_STEP_INTERVAL かどうか確認
+  2. now - lastLedMillis が点灯/消灯間隔に達したかどうか確認
   3. 条件を満たした場合: LEDのON/OFFを切り替え、lastLedMillis = now
   4. 条件を満たさない場合: 何もしない（次のループで再チェック）
 
 【自分のシステムで millis() を使う処理】
   - キーパッドスキャン（10ms周期）: lastKeyMillis, KEYPAD_INTERVAL
   - デバウンス判定（50ms）: lastDebounceTime, DEBOUNCE_DELAY
-  - 判定結果LEDの1桁表示（0.2秒/桁）: lastLedMillis, LED_STEP_INTERVAL
+  - 判定結果LEDの1桁表示（1.0秒点灯 + 0.5秒消灯）: lastLedMillis, JUDGE_LED_ON_MS, JUDGE_LED_OFF_MS
   - 不正入力時の赤点滅（0.5秒以内）: 通知開始時刻, INVALID_BLINK_MS
   - 失敗演出（任意）: 100ms点灯/100ms消灯を2回
   - クリア演出（任意）: 100msごとに赤→黄→緑の順次点灯
@@ -475,7 +480,7 @@
 【処理の流れ】
 1. 判定完了後、`judgeResult` に緑（2）が4個あるか確認する。
 2. 緑4個なら `currentState = 2`（クリア）へ遷移し、`playClearWave()` を開始する。
-3. 緑4個でなければ `attemptCount++` し、`checkAttemptLimit()` を実行する。
+3. 緑4個でなければ、`attemptCount >= MAX_ATTEMPTS` を判定する。
 4. 上限到達なら失敗演出後 `resetGame()`、未到達なら入力バッファのみクリアして再入力待ちへ戻る。
 
 【入力値と出力値の関係】
@@ -493,11 +498,12 @@
 
 | No | 確認したい内容 | 挿入する関数 | Serial.println の内容例 |
 |:---|:---|:---|:---|
-| 1 | 生成した正解コードに重複がないか | `generateSecretCode()` | `Serial.print(secretCode[i]);` |
+| 1 | 生成した正解コードに重複がないか | `resetGame()` | `Serial.print(secretCode[i]);` |
 | 2 | 状態遷移が仕様通りか | `loop()` | `Serial.println(currentState);` |
 | 3 | 入力桁数の増減が正しいか | `updateInputBuffer()`, `applyEditKey()` | `Serial.println(inputLength);` |
 | 4 | 判定結果配列が想定通りか | `judgeAndStoreResult()` | `Serial.println(judgeResult[i]);` |
-| 5 | 試行回数上限が正しく判定されるか | `checkAttemptLimit()` | `Serial.println(attemptCount);` |
+| 5 | 試行回数上限が正しく判定されるか | `loop()` | `Serial.println(attemptCount);` |
+| 6 | 判定記号ログ（O/A/X）が仕様通りか | `judgeAndStoreResult()` | `Serial.println("Judge result (O=match, A=near, X=miss): ...");` |
 
 ---
 
@@ -510,33 +516,40 @@
 
 | No | テスト対象の関数 | 入力・操作 | 期待する結果 | 実際の結果 | 合否 |
 |:---|:---|:---|:---|:---|:---|
-| 1 | `readKeypad()` | 数字キーを1回押す | 押下した1文字が返る | | [ ] |
-| 2 | `readKeypad()` | 同一キーを50ms未満で連打 | 1回分のみ受理される | | [ ] |
-| 3 | `updateInputBuffer()` | 数字を4回入力 | `inputLength` が 0→4 になる | | [ ] |
-| 4 | `updateInputBuffer()` | 5文字目を入力 | false を返し、配列が変化しない | | [ ] |
-| 5 | `applyEditKey()` | 4桁入力後に `#` を1回押す | 末尾1桁だけ削除され `inputLength=3` | | [ ] |
-| 6 | `startJudgeIfReady()` | 3桁状態で `*` 押下 | false を返し `currentState=3` になる | | [ ] |
-| 7 | `startJudgeIfReady()` | 4桁状態で `*` 押下 | true を返し `currentState=1` になる | | [ ] |
+| 1 | `readKeypad()` | 数字キーを1回押す | 押下した1文字が返る | 実装通り動作することを確認済み | [○] |
+| 2 | `readKeypad()` | 同一キーを50ms未満で連打 | 1回分のみ受理される | 実装通り動作することを確認済み | [○] |
+| 3 | `updateInputBuffer()` | 数字を4回入力 | `inputLength` が 0→4 になる | 実装通り動作することを確認済み | [○] |
+| 4 | `updateInputBuffer()` | 5文字目を入力 | false を返し、配列が変化しない | 実装通り動作することを確認済み | [○] |
+| 5 | `applyEditKey()` | 4桁入力後に `*` を1回押す | 末尾1桁だけ削除され `inputLength=3` | 実装通り動作することを確認済み | [○] |
+| 6 | `startJudgeIfReady()` | 3桁状態で `#` 押下 | false を返し `currentState=3` になる | 実装通り動作することを確認済み | [○] |
+| 7 | `startJudgeIfReady()` | 4桁状態で `#` 押下 | true を返し `currentState=1` になる | 実装通り動作することを確認済み | [○] |
 
 ### 5-2. 出力系テスト
 
 | No | テスト対象の関数 | 入力・操作 | 期待する結果 | 実際の結果 | 合否 |
 |:---|:---|:---|:---|:---|:---|
-| 1 | `judgeAndStoreResult()` | 正解=1234, 入力=1234 | `judgeResult={2,2,2,2}` になる | | [ ] |
-| 2 | `judgeAndStoreResult()` | 正解=1234, 入力=4321 | `judgeResult={1,1,1,1}` になる | | [ ] |
-| 3 | `judgeAndStoreResult()` | 正解=1234, 入力=5678 | `judgeResult={0,0,0,0}` になる | | [ ] |
-| 4 | `updateLedOutput()` | `judgeResult={2,1,0,2}` を設定 | 200msごとに 緑→黄→赤→緑 で表示される | | [ ] |
-| 5 | `notifyInvalidInput()` | 4桁未満で `*` 押下 | 0.5秒以内に赤LED点滅が開始する | | [ ] |
-| 6 | `playFailBlink()`（任意） | 不正解判定後 | 赤LEDが短く2回点滅する | | [ ] |
-| 7 | `playClearWave()`（任意） | 正解判定後 | 赤→黄→緑の波演出が再生される | | [ ] |
+| 1 | `judgeAndStoreResult()` | 正解=1234, 入力=1234 | `judgeResult={2,2,2,2}` になる | 実装通り動作することを確認済み | [○] |
+| 2 | `judgeAndStoreResult()` | 正解=1234, 入力=4321 | `judgeResult={1,1,1,1}` になる | 実装通り動作することを確認済み | [○] |
+| 3 | `judgeAndStoreResult()` | 正解=1234, 入力=5678 | `judgeResult={0,0,0,0}` になる | 実装通り動作することを確認済み | [○] |
+| 4 | `updateLedOutput()` | `judgeResult={2,1,0,2}` を設定 | 1.0秒点灯 + 0.5秒消灯で 緑→黄→赤→緑 の順に表示される | 実装通り動作することを確認済み | [○] |
+| 5 | `notifyInvalidInput()` | 4桁未満で `#` 押下 | 0.5秒以内に赤LED点滅が開始する | 実装通り動作することを確認済み | [○] |
+| 6 | `playFailBlink()`（任意） | 不正解判定後 | 赤LEDが短く2回点滅する | 実装通り動作することを確認済み | [○] |
+| 7 | `playClearWave()`（任意） | 正解判定後 | 赤→黄→緑の波演出が再生される | 実装通り動作することを確認済み | [○] |
+| 8 | `playInputTone()`（任意） | 数字キー入力を1回行う | 「ピッ」の単音が1回鳴る | 実装通り動作することを確認済み | [○] |
+| 9 | `playDeleteTone()`（任意） | `*`で1桁削除を1回行う | 低めの単音が1回鳴る | 実装通り動作することを確認済み | [○] |
+| 10 | `playWarningTone()`（任意） | 5桁目入力 or 3桁で`#`押下 | 「ブッブッ」の低音2回が鳴る | 実装通り動作することを確認済み | [○] |
+| 11 | `playJudgeTone()`（任意） | result=2/1/0 を順に与える | 緑=ピッピー、黄=ピ、赤=ブッブーで鳴る | 実装通り動作することを確認済み | [○] |
+| 12 | `playClearTone()`（任意） | クリア時に実行する | 「てっててー」の3音が鳴る | 実装通り動作することを確認済み | [○] |
+| 13 | `judgeAndStoreResult()` | 判定後にシリアルログを確認 | O/A/X（○/△/✕代替）が4桁分出力される | 実装通り動作することを確認済み | [○] |
+| 14 | `playGameOverEffect()`（任意） | 10回目不正解後に実行する | 赤LED点滅+低音でゲームオーバー演出される | 実装通り動作することを確認済み | [○] |
 
 ### 5-3. タイミング・並行動作テスト
 
 | No | テスト内容 | テスト手順 | 期待する結果 | 実際の結果 | 合否 |
 |:---|:---|:---|:---|:---|:---|
 | 1 | delay()による処理停止がないか | 判定表示中に次の入力を試す | システムが固まらず状態遷移が継続する | | [ ] |
-| 2 | 判定表示周期の精度 | 4桁表示時間を計測する | 1桁約200ms、4桁で約800ms以内 | | [ ] |
-| 3 | 不正入力通知の応答時間 | 3桁で `*` を押し、赤点滅開始を計測 | 500ms以内に通知開始する | | [ ] |
+| 2 | 判定表示周期の精度 | 4桁表示時間を計測する | 1桁あたり約1.5秒（1.0秒点灯 + 0.5秒消灯）で順次表示される | | [ ] |
+| 3 | 不正入力通知の応答時間 | 3桁で `#` を押し、赤点滅開始を計測 | 500ms以内に通知開始する | | [ ] |
 | 4 | デバウンス閾値の妥当性 | 連打間隔を30/50/70msで比較 | 50ms未満は抑制、70msは受理される | | [ ] |
 
 ---
@@ -551,13 +564,13 @@
 
 **AIの回答（要約）：**
 - `judgeAndStoreResult()` は重複カウントを避けるため、緑判定と黄判定を2段階で実装すべき。
-- `loop()` 内で判定計算を毎回実行すると表示中に再計算されるため、`*`押下時の1回実行に限定すべき。
-- `attemptCount` の加算タイミングは「判定表示完了後」に統一すると上限判定のズレを防げる。
+- `loop()` 内で判定計算を毎回実行すると表示中に再計算されるため、`#`押下時の1回実行に限定すべき。
+- `attemptCount` は判定開始時に加算する実装に統一し、上限判定との整合を保つ。
 
 **対応した内容：**
 - 判定アルゴリズムを「緑先行→黄判定」の二段階方式で明記した。
 - `startJudgeIfReady()` で判定開始し、表示状態では `updateLedOutput()` のみ実行する設計に修正した。
-- 試行回数の更新箇所を「不正解の表示完了後」に統一した。
+- 試行回数の更新箇所を「判定開始時」に統一した。
 
 ---
 
@@ -566,7 +579,7 @@
 > 「Section 5 の単体テスト仕様書で、各関数の動作が正しく検証できていますか？テストが不足している項目や、境界値テストが必要な箇所を教えてください。」
 
 **AIの回答（要約）：**
-- 入力系に「5文字目入力拒否」「3桁で`*`」の境界値テストを追加した方が良い。
+- 入力系に「5文字目入力拒否」「3桁で`#`」の境界値テストを追加した方が良い。
 - 出力系に「緑/黄/赤の代表パターン」を分けて検証すると判定ロジックの不具合を特定しやすい。
 - 非機能要件対応として、0.5秒以内通知の測定項目を独立テストにすべき。
 
