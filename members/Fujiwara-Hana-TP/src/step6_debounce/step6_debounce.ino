@@ -145,11 +145,14 @@ int convertToPwm(int level) {
 }
 
 // --- モータにPWM値を適用（正転のみ） ---
-void applyFanSpeed(int level) {
-  pwmValue = convertToPwm(level);
+// PWM値が範囲外なら0～255に補正して出力
+void applyFanSpeed(int pwm) {
+  if (pwm < 0) pwm = 0;
+  if (pwm > 255) pwm = 255;
+  pwmValue = pwm;
   digitalWrite(PIN_MOTOR_IN1, HIGH);
   digitalWrite(PIN_MOTOR_IN2, LOW);
-  analogWrite(PIN_MOTOR_PWM, pwmValue);
+  analogWrite(PIN_MOTOR_PWM, pwm);
 }
 
 // --- 現在状態・エラーをシリアル出力 ---
@@ -175,6 +178,7 @@ void handleStopRequest(int level) {
 // --- 入力段階に応じてファン速度を更新 ---
 void updateFanSpeedByLevel(int level) {
   lastValidValue = level;
-  applyFanSpeed(level);
+  int pwm = convertToPwm(level);
+  applyFanSpeed(pwm);
   printStatus(level, false);
 }
