@@ -1,4 +1,7 @@
+<<<<<<< HEAD
 // Step 6: キーパッドデバウンス付き統合テスト（設計書準拠）
+=======
+>>>>>>> ab46d6312c5b5e9bc1708aa7ff1fd6cec5e26944
 // ----------------------------------------------------------
 // 主要な流れ：
 //   1. キーパッド入力を50ms周期で監視
@@ -145,11 +148,22 @@ int convertToPwm(int level) {
 }
 
 // --- モータにPWM値を適用（正転のみ） ---
+<<<<<<< HEAD
 void applyFanSpeed(int level) {
   pwmValue = convertToPwm(level);
   digitalWrite(PIN_MOTOR_IN1, HIGH);
   digitalWrite(PIN_MOTOR_IN2, LOW);
   analogWrite(PIN_MOTOR_PWM, pwmValue);
+=======
+// PWM値が範囲外なら0～255に補正して出力
+void applyFanSpeed(int pwm) {
+  if (pwm < 0) pwm = 0;
+  if (pwm > 255) pwm = 255;
+  pwmValue = pwm;
+  digitalWrite(PIN_MOTOR_IN1, HIGH);
+  digitalWrite(PIN_MOTOR_IN2, LOW);
+  analogWrite(PIN_MOTOR_PWM, pwm);
+>>>>>>> ab46d6312c5b5e9bc1708aa7ff1fd6cec5e26944
 }
 
 // --- 現在状態・エラーをシリアル出力 ---
@@ -175,6 +189,11 @@ void handleStopRequest(int level) {
 // --- 入力段階に応じてファン速度を更新 ---
 void updateFanSpeedByLevel(int level) {
   lastValidValue = level;
+<<<<<<< HEAD
   applyFanSpeed(level);
+=======
+  int pwm = convertToPwm(level);
+  applyFanSpeed(pwm);
+>>>>>>> ab46d6312c5b5e9bc1708aa7ff1fd6cec5e26944
   printStatus(level, false);
 }
