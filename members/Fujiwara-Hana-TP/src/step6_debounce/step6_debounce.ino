@@ -140,7 +140,7 @@ int handleSpeedInput() {
 int convertToPwm(int level) {
   if (level < 0 || level > 9) return 0;
   // 0:停止, 1-9:低速→高速
-  const int pwmValues[10] = {0, 50, 78, 106, 134, 162, 190, 218, 246, 255};
+  const int pwmValues[10] = {0, 74, 78, 95, 115, 135, 160, 190, 220, 255};
   return pwmValues[level];
 }
 
